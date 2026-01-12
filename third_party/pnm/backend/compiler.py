@@ -144,9 +144,11 @@ class PNMBackend(BaseBackend):
         if language == Language.TRITON:
             stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         # Note: No ttgir stage - PNM doesn't use GPU concepts
+        # Note: No pnmir stage - we generate PNM code directly from TTIR
+        #       When C++ dialect implementation is ready, pnmir stage can be added:
+        #       stages["pnmir"] = lambda src, metadata: self.make_pnmir(src, metadata, options)
 
-        # PNM-specific stages (direct from ttir)
-        stages["pnmir"] = lambda src, metadata: self.make_pnmir(src, metadata, options)
+        # Direct: TTIR -> PNM ASM -> PNM Binary
         stages["pnmasm"] = lambda src, metadata: self.make_pnm_asm(src, metadata, options)
         stages["pnmbin"] = lambda src, metadata: self.make_pnm_bin(src, metadata, options)
 
@@ -157,6 +159,14 @@ class PNMBackend(BaseBackend):
         This stage applies general Triton IR optimizations that are
         hardware-independent.
         """
+        # Debug: Print IR before optimization
+        if options.debug:
+            print("=" * 60)
+            print("TTIR Before Optimization:")
+            print("=" * 60)
+            print(str(mod))
+            print("=" * 60)
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
 
@@ -171,6 +181,15 @@ class PNMBackend(BaseBackend):
         passes.ttir.add_loop_unroll(pm)
 
         pm.run(mod)
+
+        # Debug: Print IR after optimization
+        if options.debug:
+            print("=" * 60)
+            print("TTIR After Optimization:")
+            print("=" * 60)
+            print(str(mod))
+            print("=" * 60)
+
         return mod
 
     def make_pnmir(self, mod, metadata: dict, options: PNMOptions):
@@ -214,10 +233,24 @@ class PNMBackend(BaseBackend):
 
     def make_pnm_asm(self, src, metadata: dict, options: PNMOptions) -> str:
         """
-        Generate PNM assembly from PNM IR.
+        Generate PNM assembly directly from Triton IR (TTIR).
 
-        This stage converts the MLIR module to PNM assembly text.
+        This stage parses TTIR text and generates PNM assembly.
+        Since we don't have C++ MLIR lowering passes yet, we do
+        pattern-based translation in Python:
+
+        TTIR Pattern -> PNM Assembly
+        -----------------------------
+        tt.load      -> dma.load
+        tt.store     -> dma.store
+        tt.dot       -> matmul
+        tt.reduce    -> reduce
+        arith.addf   -> add.f32
+        arith.mulf   -> mul.f32
         """
+        # Store metadata
+        metadata["num_compute_units"] = options.num_compute_units
+        metadata["local_mem_size"] = options.local_mem_size
         # Get MLIR module as text for analysis
         # In a full implementation, this would use C++ translation infrastructure
         mlir_text = str(src)
