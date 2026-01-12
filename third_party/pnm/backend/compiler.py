@@ -130,21 +130,22 @@ class PNMBackend(BaseBackend):
         """
         Define the compilation pipeline stages.
 
-        Pipeline:
-            ttir  -> Triton IR optimization
-            ttgir -> TritonGPU IR conversion and optimization
-            pnmir -> PNM-specific IR (custom lowering)
+        Pipeline (PNM-specific - bypasses TritonGPU):
+            ttir   -> Triton IR optimization (device-agnostic)
+            pnmir  -> TritonPNM IR (PNM-specific lowering)
             pnmasm -> PNM assembly text
             pnmbin -> PNM binary
+
+        Note: Unlike GPU backends (NVIDIA/AMD) that go through TritonGPU IR,
+        PNM backend converts directly from Triton IR to TritonPNM IR.
+        This is because TritonGPU concepts (warps, CTAs, shared memory) don't
+        apply to PNM's compute unit and local memory architecture.
         """
         if language == Language.TRITON:
             stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-            stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
-        elif language == Language.GLUON:
-            # Gluon support can be added later
-            stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options)
+        # Note: No ttgir stage - PNM doesn't use GPU concepts
 
-        # PNM-specific stages
+        # PNM-specific stages (direct from ttir)
         stages["pnmir"] = lambda src, metadata: self.make_pnmir(src, metadata, options)
         stages["pnmasm"] = lambda src, metadata: self.make_pnm_asm(src, metadata, options)
         stages["pnmbin"] = lambda src, metadata: self.make_pnm_bin(src, metadata, options)
@@ -172,58 +173,23 @@ class PNMBackend(BaseBackend):
         pm.run(mod)
         return mod
 
-    def make_ttgir(self, mod, metadata: dict, options: PNMOptions):
-        """
-        Convert Triton IR to TritonGPU IR and optimize.
-
-        This stage adds GPU-like abstractions (warps, blocks) which we'll
-        map to PNM compute units in the next stage.
-        """
-        pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
-
-        # Convert to TritonGPU IR
-        # Note: We use 'pnm' target but reuse TritonGPU dialect
-        # num_warps maps to compute units in PNM context
-        passes.ttir.add_convert_to_ttgpuir(
-            pm,
-            f"pnm:{self.target.arch}",
-            options.num_compute_units,  # num_warps -> num_compute_units
-            32,  # warp_size (PNM vector width)
-            1    # num_ctas
-        )
-
-        # Optimize TritonGPU IR
-        passes.ttgpuir.add_coalesce(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
-        passes.ttgpuir.add_optimize_thread_locality(pm)
-        passes.ttgpuir.add_accelerate_matmul(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
-        passes.ttgpuir.add_optimize_dot_operands(pm, True)
-        passes.common.add_canonicalizer(pm)
-        passes.common.add_cse(pm)
-        passes.common.add_symbol_dce(pm)
-
-        pm.run(mod)
-
-        # Store metadata
-        metadata["num_compute_units"] = options.num_compute_units
-        return mod
-
-    def gluon_to_ttgir(self, mod, metadata: dict, options: PNMOptions):
-        """Convert Gluon IR to TritonGPU IR (placeholder)."""
-        # TODO: Implement Gluon support
-        return mod
-
     def make_pnmir(self, mod, metadata: dict, options: PNMOptions):
         """
-        Convert TritonGPU IR to PNM-specific IR.
+        Convert Triton IR directly to TritonPNM IR.
 
-        This is where we do PNM-specific lowering:
-        - Replace GPU memory operations with DMA operations
-        - Map tensor cores operations to PNM matrix engine
-        - Insert PNM-specific synchronization
+        This is the key lowering stage for PNM backend:
+        - tt.load/tt.store  -> ttpnm.dma_load/ttpnm.dma_store
+        - tt.dot            -> ttpnm.matmul
+        - tt.reduce         -> ttpnm.reduce
+        - Add local memory allocation for intermediate results
+        - Insert DMA synchronization (ttpnm.dma_wait)
+        - Map program_id to compute unit distribution
+
+        Note: Unlike GPU backends, we skip TritonGPU IR entirely because
+        PNM doesn't have GPU concepts (warps, CTAs, shared memory).
         """
+        # Store metadata
+        metadata["num_compute_units"] = options.num_compute_units
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
 

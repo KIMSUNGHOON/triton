@@ -37,21 +37,45 @@ pnm/
 
 ## Compilation Pipeline
 
+Unlike GPU backends (NVIDIA/AMD) that go through TritonGPU IR, PNM backend converts directly from Triton IR to TritonPNM IR. This is because TritonGPU concepts (warps, CTAs, shared memory) don't apply to PNM's compute unit and local memory architecture.
+
+```
+                         GPU Backend (NVIDIA/AMD)
+                         ┌─────────────────────────────────────┐
+Python @triton.jit ─────►│ TTIR ──► TTGIR ──► LLVM ──► PTX/GCN│
+                         └─────────────────────────────────────┘
+
+                         PNM Backend (Direct lowering)
+                         ┌─────────────────────────────────────┐
+Python @triton.jit ─────►│ TTIR ──► TTPNM ──► PNM ASM ──► BIN │
+                         └─────────────────────────────────────┘
+```
+
+### Detailed PNM Pipeline
+
 ```
 Python @triton.jit
        ↓
    Triton IR (ttir)
        ↓ make_ttir()
    Optimized TTIR
-       ↓ make_ttgir()
-   TritonGPU IR (ttgir)
-       ↓ make_pnmir()
+       ↓ make_pnmir()        ← Direct lowering (no TritonGPU)
    PNM IR (ttpnm dialect)
        ↓ make_pnm_asm()
    PNM Assembly
        ↓ make_pnm_bin()
    PNM Binary
 ```
+
+### Key Lowering Transformations (TTIR → TTPNM)
+
+| Triton IR Op | TritonPNM IR Op | Description |
+|--------------|-----------------|-------------|
+| `tt.load` | `ttpnm.dma_load` | Global → Local memory DMA |
+| `tt.store` | `ttpnm.dma_store` | Local → Global memory DMA |
+| `tt.dot` | `ttpnm.matmul` | Matrix multiplication on PNM engine |
+| `tt.reduce` | `ttpnm.reduce` | Reduction operations |
+| `tt.program_id` | `ttpnm.get_cu_id` | Compute unit distribution |
 
 ## PNM Dialect Operations
 
